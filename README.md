@@ -1,4 +1,4 @@
-# Uniapp 版 科大讯飞语音评测 Demo
+# Uniapp 小程序版 科大讯飞语音评测 Demo
 
 运行步骤：
 
