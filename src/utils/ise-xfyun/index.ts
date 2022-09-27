@@ -13,8 +13,11 @@ import CryptoES from "crypto-es";
  * @since 2022-08-30
  */
 export default class IseXfyun {
+  private readonly MAX_LAST_FRAME_CONFIRM_TIME = 3; // 最后一帧最大确认次数
+
   private isLogEnable = false;
   private audioDataList: ArrayBuffer[] = []; // 音频流数据
+  private lastFrameConfirmTime = 0; // 最后一帧确认计数
   /* socket相关 */
   private socketTask: UniApp.SocketTask | null = null;
   private handlerInterval: number | null = null;
@@ -196,6 +199,12 @@ export default class IseXfyun {
       }
       // 最后一帧
       if (this.audioDataList.length === 0) {
+        // 可能是数据消费太快，所以这里需要再三确认是否真的是最后一帧
+        if (this.lastFrameConfirmTime < this.MAX_LAST_FRAME_CONFIRM_TIME) {
+          this.lastFrameConfirmTime++;
+          this.log(`确认是否为最后一帧 ${this.lastFrameConfirmTime} 次`);
+          return;
+        }
         const params = {
           business: {
             cmd: "auw",
@@ -215,6 +224,7 @@ export default class IseXfyun {
         return this.clearHandlerInterval();
       }
       // 中间帧
+      this.lastFrameConfirmTime = 0;
       const audioData = this.audioDataList.splice(0, 1);
       const params = {
         business: {
