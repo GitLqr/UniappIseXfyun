@@ -111,10 +111,12 @@ const onRecordBtnClick = () => {
 const onRecordStart = () => {
   isRecording.value = true;
   // 录音开始，连接ws，录音的同时发送数据评测
-  iseXfyun.connect();
+  iseXfyun.start();
 };
 const onRecordStop = () => {
   isRecording.value = false;
+  // 录音结束，不会关闭ws，不再接收录音数据
+  iseXfyun.stop();
 };
 
 /**

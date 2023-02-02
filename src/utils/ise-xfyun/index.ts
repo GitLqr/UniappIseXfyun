@@ -13,11 +13,11 @@ import CryptoES from "crypto-es";
  * @since 2022-08-30
  */
 export default class IseXfyun {
-  private readonly MAX_LAST_FRAME_CONFIRM_TIME = 3; // 最后一帧最大确认次数
-
   private isLogEnable = false;
+  private isRunning = false;
+  private isFirstFrameSend = false; // 第一帧是否已经发送
+  private aue = () => (this.format === "pcm" ? "raw" : "lame");
   private audioDataList: ArrayBuffer[] = []; // 音频流数据
-  private lastFrameConfirmTime = 0; // 最后一帧确认计数
   /* socket相关 */
   private socketTask: UniApp.SocketTask | null = null;
   private handlerInterval: number | null = null;
@@ -36,7 +36,9 @@ export default class IseXfyun {
     protected callback: IseXfyunCallback,
     protected appId: string,
     protected apiKey: string = "",
-    protected apiSecret: string = ""
+    protected apiSecret: string = "",
+    protected ent: "cn_vip" | "en_vip" = "cn_vip", // 中文：cn_vip 英文：en_vip
+    protected format: "pcm" | "mp3" = "mp3"
   ) {
     if (chapter === "") throw new Error("chapter must not be empty");
     if (appId === "") throw new Error("appId must not be empty");
@@ -57,8 +59,26 @@ export default class IseXfyun {
       numberOfChannels: 1, // 录音通道数
       // encodeBitRate: 48000, // 编码码率(默认就是48000)
       frameSize: 1, // 指定帧大小，单位 KB。传入 frameSize 后，每录制指定帧大小的内容后，会回调录制的文件内容，不指定则不会回调。暂仅支持 mp3、pcm 格式。
-      format: "pcm", // 音频格式，默认是 aac
+      format: this.format, // 音频格式，默认是 aac
     };
+  }
+
+  /**
+   * 进入开始状态
+   */
+  start() {
+    this.isFirstFrameSend = false;
+    this.connect();
+  }
+
+  /**
+   * 进入退出状态
+   * 注意：
+   * 1、此方法是为了让 sendAudioData() 中知道，此时以后，若再出现 audioDataList 为空，则是真正的最后一帧。
+   * 2、此方法不会触发断开 ws ，ws 断开与否由 onMessage() 中控制。
+   */
+  stop() {
+    this.isRunning = false;
   }
 
   /**
@@ -66,7 +86,7 @@ export default class IseXfyun {
    * @param frameBuffer 帧数据
    */
   pushAudioData(frameBuffer: any) {
-    if (frameBuffer) {
+    if (this.isRunning && frameBuffer) {
       this.audioDataList.push(frameBuffer);
     }
   }
@@ -114,6 +134,7 @@ export default class IseXfyun {
     });
     this.socketTask.onOpen((res) => {
       this.log("socket open: ", res);
+      this.isRunning = true;
       this.callback.onOpen();
       setTimeout(() => {
         this.sendAudioData();
@@ -125,11 +146,13 @@ export default class IseXfyun {
     this.socketTask.onError((err) => {
       this.socketTask = null;
       this.log("socket err: ", err);
+      this.isRunning = false;
       this.callback.onError(err);
     });
     this.socketTask.onClose(() => {
       this.socketTask = null;
       this.log("socket close");
+      this.isRunning = false;
       this.callback.onClose();
     });
   }
@@ -164,34 +187,30 @@ export default class IseXfyun {
       this.log("socketTask 为 null， 无法发送数据");
       return;
     }
-    this.log("准备发送ws数据：", this.audioDataList);
-    const audioData = this.audioDataList.splice(0, 1);
     const params = {
       common: {
         app_id: this.appId,
       },
       business: {
+        aue: this.aue(),
+        auf: "audio/L16;rate=16000",
         category: this.category,
+        cmd: "ssb",
+        ent: this.ent,
+        sub: "ise",
+        text: "\uFEFF" + this.chapter,
+        ttp_skip: true,
         rstcd: "utf8",
         group: "pupil",
-        sub: "ise",
         tte: "utf-8",
-        cmd: "ssb",
-        auf: "audio/L16;rate=16000",
-        ent: "cn_vip", // 中文
-        aus: 1,
-        aue: "raw",
-        text: "\uFEFF" + this.chapter,
       },
       data: {
         status: 0,
-        encoding: "raw",
-        data_type: 1,
-        data: this.toBase64(audioData[0]),
       },
     };
     this.log("发送ws数据：", JSON.stringify(params));
     this.socketTask.send({ data: JSON.stringify(params) });
+
     this.handlerInterval = setInterval(() => {
       // websocket未连接
       if (!this.socketTask) {
@@ -199,22 +218,19 @@ export default class IseXfyun {
       }
       // 最后一帧
       if (this.audioDataList.length === 0) {
-        // 可能是数据消费太快，所以这里需要再三确认是否真的是最后一帧
-        if (this.lastFrameConfirmTime < this.MAX_LAST_FRAME_CONFIRM_TIME) {
-          this.lastFrameConfirmTime++;
-          this.log(`确认是否为最后一帧 ${this.lastFrameConfirmTime} 次`);
+        // 可能是数据消费太快（mp3是压缩格式，积攒到一定量才能拿到数据，这段时间可能比较久），这里需要确认是否真的是最后一帧
+        if (this.isRunning) {
+          this.log(`${this.format}数据暂时未能及时填充，不是最后一帧`);
           return;
         }
         const params = {
           business: {
             cmd: "auw",
             aus: 4,
-            aue: "raw",
+            aue: this.aue(),
           },
           data: {
             status: 2,
-            encoding: "raw",
-            data_type: 1,
             data: "",
           },
         };
@@ -223,24 +239,27 @@ export default class IseXfyun {
         this.audioDataList = [];
         return this.clearHandlerInterval();
       }
-      // 中间帧
-      this.lastFrameConfirmTime = 0;
+      // 中间帧(aus:2) 或 第一帧(aus:1)
       const audioData = this.audioDataList.splice(0, 1);
-      const params = {
-        business: {
-          cmd: "auw",
-          aus: 2,
-          aue: "raw",
-        },
-        data: {
-          status: 1,
-          encoding: "raw",
-          data_type: 1,
-          data: this.toBase64(audioData[0]),
-        },
-      };
-      this.log("ws数据发送中间帧: ", JSON.stringify(params));
-      this.socketTask.send({ data: JSON.stringify(params) });
+      if (audioData && audioData[0]) {
+        const params = {
+          business: {
+            cmd: "auw",
+            aus: this.isFirstFrameSend ? 2 : 1,
+            aue: this.aue(),
+          },
+          data: {
+            status: 1,
+            data: this.toBase64(audioData[0]),
+          },
+        };
+        this.log(
+          `ws数据发送${this.isFirstFrameSend ? "中间帧" : "第一帧"}: `,
+          JSON.stringify(params)
+        );
+        this.socketTask.send({ data: JSON.stringify(params) });
+        this.isFirstFrameSend = true;
+      }
     }, 40);
   }
 
